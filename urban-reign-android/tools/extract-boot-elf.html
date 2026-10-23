@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="kk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Urban Reign — SLUS_212.09 шығару</title>
+<style>
+:root{color-scheme:dark}
+body{font:16px/1.5 system-ui,sans-serif;max-width:720px;margin:0 auto;padding:24px;color:#e8edf5;background:#101722}
+main{border:1px solid #35445a;border-radius:16px;padding:22px;background:#172231}
+h1{font-size:1.4rem;line-height:1.3}
+p{color:#c3ccda}
+label,button,a{display:inline-block;margin-top:12px}
+input{display:block;width:100%;margin-top:8px}
+button,a.download{border:0;border-radius:10px;padding:12px 16px;background:#d8a64b;color:#15191f;font-weight:700;text-decoration:none}
+button:disabled{opacity:.45}
+#status{white-space:pre-wrap;overflow-wrap:anywhere;margin-top:16px;padding:12px;border-radius:8px;background:#0c131d}
+small{color:#aab7c9}
+</style>
+</head>
+<body>
+<main>
+<h1>Urban Reign: boot ELF шығару</h1>
+<p>PS2 ISO ішінен тек <code>SLUS_212.09</code> файлын шығарады. ISO файл телефоннан шықпайды және интернетке жүктелмейді. 4 ГБ файл толығымен жедел жадқа оқылмайды — тек файлдық жүйенің тақырыптары мен қажетті executable бөлігі оқылады.</p>
+<label for="iso">Өзіңнің Urban Reign (USA) ISO файлыңды таңда</label>
+<input id="iso" type="file" accept=".iso,application/octet-stream">
+<br>
+<button id="extract" disabled>SLUS_212.09 шығару</button>
+<div id="status" role="status" aria-live="polite">ISO таңдалмаған.</div>
+<div id="download"></div>
+<small>GitHub Actions кейін файлдың SHA-256 мәнін тексеріп, тек дәл сәйкес USA executable файлын қабылдайды.</small>
+</main>
+<script>
+"use strict";
+const expectedHash = "60399090fc69ffdb4c39afd30977ab50890b0e33ed6bd9374e4d9497f4246081";
+const sector = 2048;
+const picker = document.getElementById("iso");
+const button = document.getElementById("extract");
+const status = document.getElementById("status");
+const downloadBox = document.getElementById("download");
+let downloadUrl = null;
+picker.addEventListener("change", () => {
+  button.disabled = !picker.files || picker.files.length === 0;
+  downloadBox.replaceChildren();
+  if (downloadUrl) URL.revokeObjectURL(downloadUrl);
+  downloadUrl = null;
+  const file = picker.files && picker.files[0];
+  status.textContent = file ? "Таңдалды: " + file.name + "\nӨлшемі: " + (file.size / (1024 * 1024 * 1024)).toFixed(2) + " GiB. Дайын болғанда шығару батырмасын бас." : "ISO таңдалмаған.";
+});
+function u32le(bytes, offset) {
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(offset, true);
+}
+async function readSlice(file, offset, length) {
+  if (offset < 0 || length < 0 || offset + length > file.size) throw new Error("ISO ішіндегі жазба файл шекарасынан асып кетті.");
+  return new Uint8Array(await file.slice(offset, offset + length).arrayBuffer());
+}
+async function sha256(blob) {
+  if (!globalThis.crypto || !crypto.subtle) return null;
+  const digest = await crypto.subtle.digest("SHA-256", await blob.arrayBuffer());
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, "0")).join("");
+}
+button.addEventListener("click", async () => {
+  const file = picker.files && picker.files[0];
+  if (!file) return;
+  button.disabled = true;
+  downloadBox.replaceChildren();
+  if (downloadUrl) URL.revokeObjectURL(downloadUrl);
+  downloadUrl = null;
+  try {
+    status.textContent = "ISO9660 құрылымы тексеріліп жатыр…";
+    const pvd = await readSlice(file, 16 * sector, sector);
+    const descriptorId = String.fromCharCode(...pvd.slice(1, 6));
+    if (pvd[0] !== 1 || descriptorId !== "CD001") throw new Error("16-секторда ISO9660 Primary Volume Descriptor табылмады. Дұрыс, ашылған PS2 .iso файлын таңда.");
+    const rootLba = u32le(pvd, 158);
+    const rootSize = u32le(pvd, 166);
+    if (!rootLba || !rootSize || rootSize > 16 * 1024 * 1024) throw new Error("ISO түбірлік каталогының өлшемі жарамсыз.");
+    const dir = await readSlice(file, rootLba * sector, rootSize);
+    let elfOffset = -1;
+    let elfSize = 0;
+    for (let i = 0; i < dir.length;) {
+      const length = dir[i];
+      if (length === 0) {
+        i = (Math.floor(i / sector) + 1) * sector;
+        continue;
+      }
+      if (length < 34 || i + length > dir.length) { i += Math.max(1, length); continue; }
+      const nameLength = dir[i + 32];
+      if (33 + nameLength <= length) {
+        const name = new TextDecoder("ascii").decode(dir.slice(i + 33, i + 33 + nameLength)).split(";")[0].toUpperCase();
+        if (name === "SLUS_212.09") {
+          elfOffset = u32le(dir, i + 2) * sector;
+          elfSize = u32le(dir, i + 10);
+          break;
+        }
+      }
+      i += length;
+    }
+    if (elfOffset < 0) throw new Error("ISO түбірінен SLUS_212.09 табылмады. Бұл Urban Reign (USA) дискісі болмауы мүмкін.");
+    if (elfSize < 1024 * 1024 || elfSize > 64 * 1024 * 1024) throw new Error("SLUS_212.09 өлшемі күтілген шекте емес.");
+    status.textContent = "SLUS_212.09 табылды (" + (elfSize / (1024 * 1024)).toFixed(2) + " MiB). Файл тек жергілікті ISO-ның қажетті бөлігінен оқылады…";
+    const elfBytes = await readSlice(file, elfOffset, elfSize);
+    const blob = new Blob([elfBytes], {type:"application/octet-stream"});
+    const digest = await sha256(blob);
+    if (digest && digest !== expectedHash) throw new Error("SHA-256 сәйкес емес (" + digest + "). Бұл қажетті USA executable емес.");
+    downloadUrl = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.className = "download";
+    link.href = downloadUrl;
+    link.download = "SLUS_212.09";
+    link.textContent = "SLUS_212.09 файлын сақтау";
+    downloadBox.appendChild(link);
+    status.textContent = "Дайын: " + (elfSize / (1024 * 1024)).toFixed(2) + " MiB." + (digest ? "\nSHA-256 дұрыс." : "\nБұл браузер SHA-256 тексеруін қолдамайды; build workflow файлды өзі тексереді.") + "\nISO жүктелген жоқ.";
+  } catch (err) {
+    status.textContent = "Қате: " + (err && err.message ? err.message : String(err));
+  } finally {
+    button.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
